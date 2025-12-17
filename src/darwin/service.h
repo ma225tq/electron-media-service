@@ -19,4 +19,10 @@ public:
 @interface NativeMediaController : NSObject {
 }
 - (void)associateService:(DarwinMediaService*)service;
+- (MPRemoteCommandHandlerStatus)remotePlay;
+- (MPRemoteCommandHandlerStatus)remotePause;
+- (MPRemoteCommandHandlerStatus)remoteTogglePlayPause;
+- (MPRemoteCommandHandlerStatus)remoteNext;
+- (MPRemoteCommandHandlerStatus)remotePrev;
+- (MPRemoteCommandHandlerStatus)remoteChangePlaybackPosition:(MPChangePlaybackPositionCommandEvent*)event;
 @end

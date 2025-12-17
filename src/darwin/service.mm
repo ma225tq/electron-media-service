@@ -1,6 +1,50 @@
 #include "module.h"
 #include "nan.h"
 #import <AppKit/AppKit.h>
+#include <queue>
+#include <mutex>
+
+// Thread-safe event queue
+struct MediaEvent {
+  std::string name;
+  int details;
+};
+
+static std::queue<MediaEvent> eventQueue;
+static std::mutex eventMutex;
+static uv_async_t asyncHandle;
+static Nan::Callback persistentCallback;
+static bool asyncInitialized = false;
+
+// Called on Node.js thread when uv_async_send is triggered
+static void AsyncCallback(uv_async_t* handle) {
+  Nan::HandleScope scope;
+
+  std::lock_guard<std::mutex> lock(eventMutex);
+  while (!eventQueue.empty()) {
+    MediaEvent event = eventQueue.front();
+    eventQueue.pop();
+
+    v8::Isolate* isolate = v8::Isolate::GetCurrent();
+    v8::Local<v8::Value> argv[2] = {
+      Nan::New(event.name).ToLocalChecked(),
+      Nan::New(event.details)
+    };
+
+    persistentCallback.Call(2, argv);
+  }
+}
+
+// Thread-safe emit function
+static void QueueEvent(const std::string& eventName, int details) {
+  {
+    std::lock_guard<std::mutex> lock(eventMutex);
+    eventQueue.push({eventName, details});
+  }
+  if (asyncInitialized) {
+    uv_async_send(&asyncHandle);
+  }
+}
 
 @implementation NativeMediaController
   DarwinMediaService* _service;
@@ -9,42 +53,57 @@
   _service = service;
 }
 
-- (void)remotePlay { _service->Emit("play"); }
-- (void)remotePause { _service->Emit("pause"); }
-- (void)remoteTogglePlayPause { _service->Emit("playPause"); }
-- (void)remoteNext { _service->Emit("next"); }
-- (void)remotePrev { _service->Emit("previous"); }
-
-- (void)remoteChangePlaybackPosition:(MPChangePlaybackPositionCommandEvent*)event {
-  _service->EmitWithInt("seek", event.positionTime);
+- (MPRemoteCommandHandlerStatus)remotePlay {
+  QueueEvent("play", -1);
+  return MPRemoteCommandHandlerStatusSuccess;
 }
 
-- (MPRemoteCommandHandlerStatus)move:(MPChangePlaybackPositionCommandEvent*)event {
+- (MPRemoteCommandHandlerStatus)remotePause {
+  QueueEvent("pause", -1);
+  return MPRemoteCommandHandlerStatusSuccess;
+}
+
+- (MPRemoteCommandHandlerStatus)remoteTogglePlayPause {
+  QueueEvent("playPause", -1);
+  return MPRemoteCommandHandlerStatusSuccess;
+}
+
+- (MPRemoteCommandHandlerStatus)remoteNext {
+  QueueEvent("next", -1);
+  return MPRemoteCommandHandlerStatusSuccess;
+}
+
+- (MPRemoteCommandHandlerStatus)remotePrev {
+  QueueEvent("previous", -1);
+  return MPRemoteCommandHandlerStatusSuccess;
+}
+
+- (MPRemoteCommandHandlerStatus)remoteChangePlaybackPosition:(MPChangePlaybackPositionCommandEvent*)event {
+  QueueEvent("seek", (int)event.positionTime);
   return MPRemoteCommandHandlerStatusSuccess;
 }
 
 @end
 
-// static Persistent<Function> persistentCallback;
-static Nan::Callback persistentCallback;
 NAN_METHOD(DarwinMediaService::Hook) {
   Nan::ObjectWrap::Unwrap<DarwinMediaService>(info.This());
 
   v8::Local<v8::Function> function = v8::Local<v8::Function>::Cast(info[0]);
   persistentCallback.SetFunction(function);
+
+  // Initialize async handle on first hook
+  if (!asyncInitialized) {
+    uv_async_init(uv_default_loop(), &asyncHandle, AsyncCallback);
+    asyncInitialized = true;
+  }
 }
 
 void DarwinMediaService::Emit(std::string eventName) {
-  EmitWithInt(eventName, 0);
+  QueueEvent(eventName, -1);
 }
 
 void DarwinMediaService::EmitWithInt(std::string eventName, int details) {
-  v8::Local<v8::Value> argv[2] = {
-    v8::String::NewFromUtf8(v8::Isolate::GetCurrent(), eventName.c_str()),
-    v8::Integer::New(v8::Isolate::GetCurrent(), details)
-  };
-
-  persistentCallback.Call(2, argv);
+  QueueEvent(eventName, details);
 }
 
 NAN_METHOD(DarwinMediaService::New) {
@@ -77,7 +136,7 @@ NAN_METHOD(DarwinMediaService::StartService) {
 
 NAN_METHOD(DarwinMediaService::StopService) {
   Nan::ObjectWrap::Unwrap<DarwinMediaService>(info.This());
-  
+
   MPRemoteCommandCenter *remoteCommandCenter = [MPRemoteCommandCenter sharedCommandCenter];
   [remoteCommandCenter playCommand].enabled = false;
   [remoteCommandCenter pauseCommand].enabled = false;
@@ -93,9 +152,16 @@ NAN_METHOD(DarwinMediaService::SetMetaData) {
   std::string songAlbum = *Nan::Utf8String(info[2]);
   std::string songState = *Nan::Utf8String(info[3]);
 
-  unsigned int songID = info[4]->Uint32Value();
-  unsigned int currentTime = info[5]->Uint32Value();
-  unsigned int duration = info[6]->Uint32Value();
+  v8::Local<v8::Context> context = info.GetIsolate()->GetCurrentContext();
+  unsigned int songID = info[4]->Uint32Value(context).FromJust();
+  unsigned int currentTime = info[5]->Uint32Value(context).FromJust();
+  unsigned int duration = info[6]->Uint32Value(context).FromJust();
+
+  // Optional artwork path (info[7])
+  std::string artworkPath = "";
+  if (info.Length() > 7 && !info[7]->IsNullOrUndefined()) {
+    artworkPath = *Nan::Utf8String(info[7]);
+  }
 
   NSMutableDictionary *songInfo = [[NSMutableDictionary alloc] init];
   [songInfo setObject:[NSString stringWithUTF8String:songTitle.c_str()] forKey:MPMediaItemPropertyTitle];
@@ -104,6 +170,18 @@ NAN_METHOD(DarwinMediaService::SetMetaData) {
   [songInfo setObject:[NSNumber numberWithFloat:currentTime] forKey:MPNowPlayingInfoPropertyElapsedPlaybackTime];
   [songInfo setObject:[NSNumber numberWithFloat:duration] forKey:MPMediaItemPropertyPlaybackDuration];
   [songInfo setObject:[NSNumber numberWithFloat:songID] forKey:MPMediaItemPropertyPersistentID];
+
+  // Add artwork if path is provided
+  if (!artworkPath.empty()) {
+    NSString *path = [NSString stringWithUTF8String:artworkPath.c_str()];
+    NSImage *image = [[NSImage alloc] initWithContentsOfFile:path];
+    if (image) {
+      MPMediaItemArtwork *artwork = [[MPMediaItemArtwork alloc] initWithBoundsSize:image.size requestHandler:^NSImage * _Nonnull(CGSize size) {
+        return image;
+      }];
+      [songInfo setObject:artwork forKey:MPMediaItemPropertyArtwork];
+    }
+  }
 
   if (songState == "playing") {
     [MPNowPlayingInfoCenter defaultCenter].playbackState = MPNowPlayingPlaybackStatePlaying;
