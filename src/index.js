@@ -1,11 +1,16 @@
 const os = require('os');
-const semver = require('semver');
 
 module.exports = require('./NullService');
 
+// Check macOS version >= 16.1.0 (Sierra 10.12+) without semver
+function isMinMacOSVersion(minMajor, minMinor) {
+  const [major, minor] = os.release().split('.').map(Number);
+  return major > minMajor || (major === minMajor && minor >= minMinor);
+}
+
 switch (process.platform) {
   case 'darwin': {
-    if (semver.satisfies(os.release(), '>=16.1.0')) {
+    if (isMinMacOSVersion(16, 1)) {
       module.exports = require('./darwin');
     }
     break;

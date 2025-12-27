@@ -1,4 +1,39 @@
-const { DarwinMediaService } = require('bindings')('electron_media_service.node');
+const path = require('path');
+const { app } = require('electron');
+
+// bindings doesn't work with asar, manually resolve path
+function loadNativeModule() {
+  const moduleName = 'electron_media_service.node';
+  const possiblePaths = [];
+
+  // In packaged app
+  if (app && app.isPackaged) {
+    const unpackedBase = app.getAppPath().replace('app.asar', 'app.asar.unpacked');
+    possiblePaths.push(
+      path.join(unpackedBase, 'electron-media-service/build/Release', moduleName),
+      path.join(unpackedBase, 'electron-media-service/bin', `darwin-${process.arch}-${process.versions.modules}`, moduleName.replace('.node', '.node'))
+    );
+  }
+
+  // Development paths
+  possiblePaths.push(
+    path.join(__dirname, '../../build/Release', moduleName),
+    path.join(__dirname, '../../bin', `darwin-${process.arch}-${process.versions.modules}`, moduleName.replace('electron_media_service', 'electron-media-service'))
+  );
+
+  for (const p of possiblePaths) {
+    try {
+      return require(p);
+    } catch (e) {
+      continue;
+    }
+  }
+
+  // Fallback to bindings
+  return require('bindings')(moduleName);
+}
+
+const { DarwinMediaService } = loadNativeModule();
 const { EventEmitter } = require('events');
 
 class MediaService extends EventEmitter {
