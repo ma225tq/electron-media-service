@@ -142,6 +142,23 @@ NAN_METHOD(DarwinMediaService::StopService) {
   [remoteCommandCenter pauseCommand].enabled = false;
   [remoteCommandCenter togglePlayPauseCommand].enabled = false;
   [remoteCommandCenter changePlaybackPositionCommand].enabled = false;
+
+  // Clean up async handle and callback BEFORE V8 shuts down
+  if (asyncInitialized) {
+    uv_close((uv_handle_t*)&asyncHandle, nullptr);
+    asyncInitialized = false;
+  }
+
+  // Reset the persistent callback while V8 is still alive
+  persistentCallback.Reset();
+
+  // Clear any pending events
+  {
+    std::lock_guard<std::mutex> lock(eventMutex);
+    while (!eventQueue.empty()) {
+      eventQueue.pop();
+    }
+  }
 }
 
 NAN_METHOD(DarwinMediaService::SetMetaData) {
