@@ -13,7 +13,7 @@ struct MediaEvent {
 static std::queue<MediaEvent> eventQueue;
 static std::mutex eventMutex;
 static uv_async_t asyncHandle;
-static Nan::Callback persistentCallback;
+static Nan::Callback* persistentCallback = nullptr;  // Pointer to avoid static destructor crash
 static bool asyncInitialized = false;
 
 // Called on Node.js thread when uv_async_send is triggered
@@ -25,13 +25,14 @@ static void AsyncCallback(uv_async_t* handle) {
     MediaEvent event = eventQueue.front();
     eventQueue.pop();
 
-    v8::Isolate* isolate = v8::Isolate::GetCurrent();
-    v8::Local<v8::Value> argv[2] = {
-      Nan::New(event.name).ToLocalChecked(),
-      Nan::New(event.details)
-    };
+    if (persistentCallback) {
+      v8::Local<v8::Value> argv[2] = {
+        Nan::New(event.name).ToLocalChecked(),
+        Nan::New(event.details)
+      };
 
-    persistentCallback.Call(2, argv);
+      persistentCallback->Call(2, argv);
+    }
   }
 }
 
@@ -89,7 +90,12 @@ NAN_METHOD(DarwinMediaService::Hook) {
   Nan::ObjectWrap::Unwrap<DarwinMediaService>(info.This());
 
   v8::Local<v8::Function> function = v8::Local<v8::Function>::Cast(info[0]);
-  persistentCallback.SetFunction(function);
+
+  // Allocate callback if needed
+  if (!persistentCallback) {
+    persistentCallback = new Nan::Callback();
+  }
+  persistentCallback->SetFunction(function);
 
   // Initialize async handle on first hook
   if (!asyncInitialized) {
@@ -143,14 +149,14 @@ NAN_METHOD(DarwinMediaService::StopService) {
   [remoteCommandCenter togglePlayPauseCommand].enabled = false;
   [remoteCommandCenter changePlaybackPositionCommand].enabled = false;
 
-  // Clean up async handle and callback BEFORE V8 shuts down
-  if (asyncInitialized) {
-    uv_close((uv_handle_t*)&asyncHandle, nullptr);
-    asyncInitialized = false;
+  // Clean up callback while V8 is still alive
+  // Note: Don't call uv_close here - it's async and V8 may shut down before it completes causing a crash
+  if (persistentCallback) {
+    persistentCallback->Reset();
+    delete persistentCallback;
+    persistentCallback = nullptr;
   }
-
-  // Reset the persistent callback while V8 is still alive
-  persistentCallback.Reset();
+  asyncInitialized = false;
 
   // Clear any pending events
   {
